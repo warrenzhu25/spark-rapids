@@ -8,6 +8,7 @@ This guide provides a comprehensive, step-by-step walkthrough for adding GPU-acc
 - [Understanding the Architecture](#understanding-the-architecture)
 - [Implementation Process Overview](#implementation-process-overview)
 - [End-to-End Example: Adding GpuAcos](#end-to-end-example-adding-gpuacos)
+- [Complex Operators - Beyond Simple Expressions](#complex-operators---beyond-simple-expressions)
 - [Testing Strategy](#testing-strategy)
 - [Build and Verification](#build-and-verification)
 - [Common Pitfalls and Best Practices](#common-pitfalls-and-best-practices)
@@ -532,6 +533,590 @@ Check that the implementation follows project patterns:
 4. ✅ Registered in `GpuOverrides.scala`
 5. ✅ Uses standard type checks (`ExprChecks.mathUnaryWithAst`)
 
+## Complex Operators - Beyond Simple Expressions
+
+Now that you've mastered simple unary operators like `GpuAcos`, you may want to tackle more complex operators. This section explains what makes operators complex and provides detailed examples for aggregate functions and joins.
+
+### What Makes an Operator "Complex"?
+
+Complex operators differ from simple expressions in several ways:
+
+| Complexity Factor | Simple (Acos) | Complex (Join/Aggregate) |
+|-------------------|---------------|--------------------------|
+| **Number of inputs** | Single column | Multiple tables/columns |
+| **State management** | Stateless | May maintain state/buffers |
+| **Memory usage** | Minimal | Can cache/buffer data |
+| **Base classes** | `UnaryExprMeta` | `SparkPlanMeta`, `AggExprMeta` |
+| **Files to modify** | 2 files | 3-5 files |
+| **Testing complexity** | Unit tests sufficient | Needs extensive integration tests |
+| **Edge cases** | Few (nulls, NaN) | Many (empty tables, skew, OOM) |
+| **Spark knowledge** | Basic | Moderate to advanced |
+
+### Operator Complexity Spectrum
+
+Understanding where an operator falls on the complexity spectrum helps you gauge the effort required:
+
+```
+Level 1: Simple Unary Expressions
+├─ acos, sqrt, abs, upper, lower
+├─ Single input → single output
+├─ No state, pure functions
+└─ Example: GpuAcos
+
+Level 2: Binary Expressions
+├─ add, multiply, concat, contains
+├─ Two inputs → single output
+├─ Still stateless
+└─ Example: GpuAdd
+
+Level 3: Aggregate Functions
+├─ sum, count, avg, max, min
+├─ Many inputs → single or grouped outputs
+├─ Maintains aggregation state
+└─ Example: GpuSum
+
+Level 4: Window Functions
+├─ rank, row_number, running_sum
+├─ Operates on partitions with ordering
+├─ Complex state management
+└─ Example: GpuRunningSum
+
+Level 5: Join Operations
+├─ inner, left_outer, right_outer, anti, semi
+├─ Combines two tables
+├─ Build/stream sides, broadcast vs shuffle
+└─ Example: GpuBroadcastHashJoin
+
+Level 6: Multi-Stage Physical Plans
+├─ Sort-merge-join, complex aggregates
+├─ Multiple execution stages
+├─ Advanced optimization and memory management
+└─ Example: GpuSortMergeJoin
+```
+
+**Recommendation:** Start at Level 1, build 2-3 operators, then progress to Level 2, and so on.
+
+### Example 1: Aggregate Function (GpuSum)
+
+Aggregate functions are more complex than simple expressions because they maintain state across multiple input rows.
+
+#### How Aggregates Work
+
+```
+Input Data:          Aggregate Process:           Output:
+[1, 2, 3, 4, 5]  →  Initialize: sum = 0     →   15
+                     Update: sum += 1
+                     Update: sum += 2
+                     Update: sum += 3
+                     Update: sum += 4
+                     Update: sum += 5
+                     Finalize: return sum
+```
+
+In distributed scenarios, aggregates also need to **merge** partial results:
+
+```
+Worker 1: [1, 2, 3]  →  Partial: 6  ┐
+Worker 2: [4, 5]     →  Partial: 9  ├→  Merge: 6 + 9 = 15
+```
+
+#### GPU Sum Implementation
+
+**File:** `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/aggregate/aggregateFunctions.scala`
+
+```scala
+// Wrapper that delegates to cuDF's sum aggregation
+class CudfSum(override val dataType: DataType) extends CudfAggregate {
+  @transient lazy val rapidsSumType: DType =
+    GpuColumnVector.getNonNestedRapidsType(dataType)
+
+  // For full-column reduction (no grouping)
+  override val reductionAggregate: cudf.ColumnVector => cudf.Scalar =
+    (col: cudf.ColumnVector) => col.sum(rapidsSumType)
+
+  // For group-by aggregation
+  override lazy val groupByAggregate: GroupByAggregation =
+    GroupByAggregation.sum()
+
+  override val name: String = "CudfSum"
+}
+
+// High-level GPU Sum expression
+abstract class GpuSum(
+    child: Expression,
+    resultType: DataType,
+    failOnErrorOverride: Boolean)
+    extends GpuAggregateFunction
+    with ImplicitCastInputTypes
+    with Serializable {
+
+  // Initial value for aggregation state
+  override lazy val initialValues: Seq[GpuLiteral] =
+    Seq(GpuLiteral(0, dataType))
+
+  // Project input to prepare for aggregation
+  override lazy val inputProjection: Seq[Expression] = Seq(child)
+
+  // Update aggregation state with new input
+  override lazy val updateAggregates: Seq[CudfAggregate] =
+    Seq(new CudfSum(dataType))
+
+  // Merge partial aggregates from different partitions
+  override lazy val mergeAggregates: Seq[CudfAggregate] =
+    Seq(new CudfSum(dataType))
+
+  // Final result expression
+  override lazy val evaluateExpression: Expression = aggBufferAttributes.head
+
+  override val dataType: DataType = resultType
+  override def nullable: Boolean = true
+  override def children: Seq[Expression] = Seq(child)
+}
+```
+
+#### Key Concepts for Aggregates
+
+1. **Initial Values**: Starting state for the aggregation (e.g., 0 for sum, empty list for collect)
+
+2. **Input Projection**: How to transform input before aggregating
+
+3. **Update Aggregates**: How to incorporate new rows into the aggregate state
+
+4. **Merge Aggregates**: How to combine partial results from different workers
+
+5. **Evaluate Expression**: How to compute the final result from the aggregate state
+
+#### Registering an Aggregate
+
+**File:** `sql-plugin/src/main/scala/com/nvidia/spark/rapids/GpuOverrides.scala` (around line 2322)
+
+```scala
+expr[Sum](
+  "Sum aggregate operator",
+  ExprChecks.fullAgg(
+    // Output types
+    TypeSig.LONG + TypeSig.DOUBLE + TypeSig.DECIMAL_128,
+    TypeSig.LONG + TypeSig.DOUBLE + TypeSig.DECIMAL_128,
+    // Input parameter checks
+    Seq(ParamCheck("input", TypeSig.gpuNumeric, TypeSig.cpuNumeric))),
+  (a, conf, p, r) => new AggExprMeta[Sum](a, conf, p, r) {
+    override def tagAggForGpu(): Unit = {
+      val inputDataType = a.child.dataType
+      // Additional validation logic for decimal overflow, etc.
+      GpuOverrides.checkAndTagFloatAgg(inputDataType, conf, this)
+    }
+
+    override def convertToGpu(childExprs: Seq[Expression]): GpuExpression = {
+      val child = childExprs.head
+      GpuSum(child, a.dataType, failOnError = SQLConf.get.ansiEnabled)
+    }
+  })
+```
+
+**What's different from simple expressions:**
+- Uses `AggExprMeta` instead of `UnaryExprMeta`
+- Uses `ExprChecks.fullAgg()` for type checking
+- Implements `tagAggForGpu()` for aggregate-specific validation
+- More complex state management in the GPU implementation
+
+#### Testing Aggregates
+
+**Integration test example:**
+```python
+# File: integration_tests/src/main/python/hash_aggregate_test.py
+
+@pytest.mark.parametrize('data_gen', numeric_gens, ids=idfn)
+def test_hash_agg_with_sum(data_gen):
+    """Test SUM aggregate with hash aggregation"""
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: gen_df(spark, [
+            ('a', data_gen),
+            ('b', IntegerGen())
+        ]).groupBy('b').agg(f.sum('a')))
+```
+
+### Example 2: Join Operations (BroadcastHashJoin)
+
+Joins are among the most complex operators because they:
+- Process two input tables (left and right)
+- Require choosing a build side (smaller table) and stream side
+- Support multiple join types (inner, outer, semi, anti)
+- Must handle broadcast data distribution
+- Have significant memory implications
+
+#### How Broadcast Hash Join Works
+
+```
+Left Table (Large)      Right Table (Small, Broadcast)
+┌────┬───────┐          ┌────┬────────┐
+│ ID │ Name  │          │ ID │ City   │
+├────┼───────┤          ├────┼────────┤
+│ 1  │ Alice │          │ 1  │ NYC    │  ← Broadcasted to all workers
+│ 2  │ Bob   │          │ 3  │ LA     │
+│ 3  │ Carol │          └────┴────────┘
+└────┴───────┘
+     ↓                        ↓
+   Stream Side            Build Side (Hash Table)
+
+Join Process:
+1. Broadcast right table to all workers
+2. Build hash table from right table (ID → City)
+3. Stream through left table
+4. For each left row, probe hash table with join key
+5. Output matched rows
+
+Result:
+┌────┬───────┬──────┐
+│ ID │ Name  │ City │
+├────┼───────┼──────┤
+│ 1  │ Alice │ NYC  │
+│ 3  │ Carol │ LA   │
+└────┴───────┴──────┘
+```
+
+#### Architecture Overview
+
+```
+BroadcastHashJoinExec (Spark CPU)
+       ↓
+GpuBroadcastHashJoinMeta (Validation & Tagging)
+  │
+  ├─ Check join type supported
+  ├─ Validate join keys are GPU-compatible
+  ├─ Verify build side can fit in GPU memory
+  ├─ Check condition expression (if any)
+  └─ Tag children for GPU replacement
+       ↓
+GpuBroadcastHashJoinExecBase (GPU Execution)
+  │
+  ├─ Receive broadcast hash table
+  ├─ Stream through other side
+  ├─ Probe hash table using cuDF join APIs
+  └─ Return joined result batches
+```
+
+#### Meta Class (Validation Layer)
+
+**File:** `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuBroadcastHashJoinExecBase.scala`
+
+```scala
+abstract class GpuBroadcastHashJoinMetaBase(
+    join: BroadcastHashJoinExec,
+    conf: RapidsConf,
+    parent: Option[RapidsMeta[_, _, _]],
+    rule: DataFromReplacementRule)
+  extends GpuBroadcastJoinMeta[BroadcastHashJoinExec](join, conf, parent, rule) {
+
+  // Wrap join keys for validation
+  val leftKeys: Seq[BaseExprMeta[_]] =
+    join.leftKeys.map(GpuOverrides.wrapExpr(_, conf, Some(this)))
+  val rightKeys: Seq[BaseExprMeta[_]] =
+    join.rightKeys.map(GpuOverrides.wrapExpr(_, conf, Some(this)))
+
+  // Wrap optional join condition
+  val conditionMeta: Option[BaseExprMeta[_]] =
+    join.condition.map(GpuOverrides.wrapExpr(_, conf, Some(this)))
+
+  // Determine which side to build (smaller table)
+  val buildSide: GpuBuildSide = GpuJoinUtils.getGpuBuildSide(join.buildSide)
+
+  override def tagPlanForGpu(): Unit = {
+    // Validate join type and keys
+    GpuHashJoin.tagJoin(this, join.joinType, buildSide,
+      join.leftKeys, join.rightKeys, conditionMeta)
+
+    // Validate build side compatibility
+    GpuHashJoin.tagBuildSide(this, join.joinType, buildSide)
+
+    // Check if broadcast side can be on GPU
+    val buildSideMeta = buildSide match {
+      case GpuBuildLeft => childPlans.head
+      case GpuBuildRight => childPlans(1)
+    }
+
+    if (!canBuildSideBeReplaced(buildSideMeta)) {
+      willNotWorkOnGpu("the broadcast for this join must be on the GPU too")
+    }
+  }
+
+  def convertToGpu(): GpuExec  // Implemented by subclasses
+}
+```
+
+**What the Meta class does:**
+1. **Wraps join keys**: Validates each join key expression can run on GPU
+2. **Determines build side**: Chooses which table to broadcast based on size
+3. **Validates join type**: Checks if GPU supports this join type (Inner, LeftOuter, etc.)
+4. **Checks broadcast compatibility**: Ensures broadcast data is also on GPU
+5. **Tags for GPU**: Marks the join for GPU execution if all checks pass
+
+#### GPU Execution Class
+
+```scala
+abstract class GpuBroadcastHashJoinExecBase(
+    leftKeys: Seq[Expression],
+    rightKeys: Seq[Expression],
+    joinType: JoinType,
+    buildSide: GpuBuildSide,
+    condition: Option[Expression],
+    left: SparkPlan,
+    right: SparkPlan)
+  extends ShimBinaryExecNode with GpuHashJoin {
+
+  override def doExecuteColumnar(): RDD[ColumnarBatch] = {
+    val builtTable = buildSide match {
+      case GpuBuildLeft => left
+      case GpuBuildRight => right
+    }
+
+    // Get broadcast hash table
+    val broadcastRelation = builtTable.executeBroadcast[SerializeConcatHostBuffersDeserializeBatch]()
+
+    val streamedPlan = buildSide match {
+      case GpuBuildLeft => right
+      case GpuBuildRight => left
+    }
+
+    // Stream through the other side and join with broadcast table
+    streamedPlan.executeColumnar().mapPartitions { streamedIter =>
+      val builtBatch = broadcastRelation.value.batch
+
+      withResource(builtBatch) { built =>
+        // Use cuDF hash join
+        doJoin(built, streamedIter, buildSide, joinType, condition)
+      }
+    }
+  }
+
+  // Actual join logic using cuDF
+  def doJoin(
+      builtTable: ColumnarBatch,
+      streamIter: Iterator[ColumnarBatch],
+      targetSize: Long): Iterator[ColumnarBatch] = {
+
+    // Convert to cuDF tables
+    val builtCudfTable = GpuColumnVector.from(builtTable)
+
+    streamIter.flatMap { streamBatch =>
+      withResource(GpuColumnVector.from(streamBatch)) { streamTable =>
+        // Perform cuDF hash join
+        val joinResult = joinType match {
+          case Inner => streamTable.innerJoin(builtCudfTable, leftKeys, rightKeys)
+          case LeftOuter => streamTable.leftJoin(builtCudfTable, leftKeys, rightKeys)
+          case RightOuter => streamTable.rightJoin(builtCudfTable, leftKeys, rightKeys)
+          // ... other join types
+        }
+
+        // Convert result back to ColumnarBatch
+        withResource(joinResult) { result =>
+          GpuColumnVector.from(result, outputSchema)
+        }
+      }
+    }
+  }
+}
+```
+
+#### Registering a Join
+
+**File:** `sql-plugin/src/main/scala/com/nvidia/spark/rapids/GpuOverrides.scala` (around line 4493)
+
+```scala
+exec[BroadcastHashJoinExec](
+  "Implementation of join using broadcast data",
+  JoinTypeChecks.equiJoinExecChecks,  // Pre-defined checks for joins
+  (join, conf, p, r) => new GpuBroadcastHashJoinMeta(join, conf, p, r))
+```
+
+**What's different from expressions:**
+- Uses `exec[...]` instead of `expr[...]` (it's a physical plan operator)
+- Uses `JoinTypeChecks.equiJoinExecChecks` for comprehensive join validation
+- Meta class is much more complex with multiple validation steps
+- GPU execution involves RDD operations and partition-level processing
+
+#### Join Type Checks Explained
+
+```scala
+object JoinTypeChecks {
+  // Supported data types for join keys
+  private val cudfSupportedKeyTypes =
+    (TypeSig.commonCudfTypes + TypeSig.NULL +
+     TypeSig.DECIMAL_128 + TypeSig.STRUCT).nested()
+
+  // Data types that can "ride along" in join (non-key columns)
+  private val joinRideAlongTypes =
+    (cudfSupportedKeyTypes + TypeSig.BINARY +
+     TypeSig.ARRAY + TypeSig.MAP).nested()
+
+  val equiJoinExecChecks: ExecChecks = ExecChecks(
+    joinRideAlongTypes,  // What can be in output
+    TypeSig.all,         // What Spark supports
+    Map(
+      LEFT_KEYS -> InputCheck(cudfSupportedKeyTypes, sparkSupportedJoinKeyTypes),
+      RIGHT_KEYS -> InputCheck(cudfSupportedKeyTypes, sparkSupportedJoinKeyTypes),
+      CONDITION -> InputCheck(TypeSig.BOOLEAN, TypeSig.BOOLEAN)))
+}
+```
+
+**What this means:**
+- **Left/Right Keys**: Must be types cuDF can hash and compare (no maps or complex arrays)
+- **Ride-along columns**: Can be almost any type (including arrays, maps)
+- **Condition**: Optional boolean expression for additional filtering
+
+#### Testing Joins
+
+**Integration test example:**
+```python
+# File: integration_tests/src/main/python/join_test.py
+
+@pytest.mark.parametrize('data_gen', all_gen, ids=idfn)
+@pytest.mark.parametrize('join_type', ['Inner', 'Left', 'Right', 'FullOuter'], ids=idfn)
+def test_broadcast_hash_join(data_gen, join_type):
+    """Test broadcast hash join with various data types and join types"""
+    def do_join(spark):
+        left_df = binary_op_df(spark, data_gen)
+        right_df = binary_op_df(spark, data_gen)
+        # Use broadcast hint to force broadcast join
+        return left_df.join(broadcast(right_df),
+                           left_df.a == right_df.a,
+                           join_type)
+
+    assert_gpu_and_cpu_are_equal_collect(do_join, conf={
+        'spark.sql.autoBroadcastJoinThreshold': '10MB'
+    })
+```
+
+### Key Differences: Simple vs. Complex Operators
+
+| Aspect | Simple (GpuAcos) | Aggregate (GpuSum) | Join (BroadcastHashJoin) |
+|--------|------------------|---------------------|--------------------------|
+| **Inputs** | 1 column | Multiple rows | 2 tables |
+| **State** | Stateless | Aggregation buffer | Hash table |
+| **Base class** | `UnaryExprMeta` | `AggExprMeta` | `SparkPlanMeta` |
+| **Registration** | `expr[Acos]` | `expr[Sum]` | `exec[BroadcastHashJoinExec]` |
+| **Type checks** | `ExprChecks.mathUnary` | `ExprChecks.fullAgg` | `JoinTypeChecks.equiJoinExecChecks` |
+| **Files modified** | 2 (impl + registry) | 3 (impl + registry + tests) | 4-5 (meta + exec + registry + tests) |
+| **Validation** | Type compatibility | Type + overflow checks | Type + build side + memory + distribution |
+| **cuDF API** | `column.arccos()` | `column.sum()` | `table.leftJoin(other)` |
+| **Memory** | Input size | Aggregation buffer size | Build side must fit in memory |
+| **Testing** | Unit + integration | Unit + integration + aggregate-specific | Unit + integration + join-specific |
+
+### When to Tackle Complex Operators
+
+#### ✅ You're Ready When:
+
+1. **You've completed 2-3 simple operators successfully**
+   - Comfortable with the build process
+   - Understand type signatures
+   - Know how to write and run tests
+
+2. **You understand the operator's Spark implementation**
+   - Read Spark's source code for the operator
+   - Understand the algorithm and edge cases
+   - Know why certain design choices were made
+
+3. **cuDF supports the operation**
+   - Check cuDF documentation
+   - Verify the operation exists and is stable
+   - Understand cuDF's API and limitations
+
+4. **You have time for extensive testing**
+   - Complex operators have many edge cases
+   - Testing takes significantly longer
+   - May require performance tuning
+
+#### ⚠️ Consider Waiting If:
+
+- **This is your first contribution** → Start with Level 1-2 operators
+- **Limited Spark knowledge** → Study Spark internals first
+- **Tight deadline** → Complex operators take weeks, not days
+- **Unsure about cuDF support** → Verify cuDF capabilities first
+
+### Practical Tips for Complex Operators
+
+#### 1. **Start by Copying a Similar Operator**
+
+```bash
+# For aggregates, copy from existing aggregate
+cp aggregateFunctions.scala my_new_aggregate.scala
+
+# For joins, study existing join implementation
+# Don't copy - joins are too complex and specific
+```
+
+#### 2. **Incremental Development**
+
+```
+Week 1: Meta class + basic validation
+Week 2: GPU implementation for simplest case (e.g., Inner join only)
+Week 3: Add support for other cases (LeftOuter, RightOuter, etc.)
+Week 4: Testing and edge case handling
+Week 5: Performance tuning and optimization
+```
+
+#### 3. **Use GPU Memory Profiling**
+
+```scala
+// Add logging to track memory usage
+logInfo(s"Build side size: ${builtTable.sizeInBytes} bytes")
+GpuSemaphore.acquireIfNecessary(TaskContext.get())
+```
+
+#### 4. **Test Incrementally**
+
+```bash
+# Start with tiny datasets
+./runtests.py -k test_my_join --debug --limit_rows=100
+
+# Gradually increase size
+./runtests.py -k test_my_join --limit_rows=10000
+
+# Finally, test at scale
+./runtests.py -k test_my_join
+```
+
+#### 5. **Pay Attention to Build Side Validation**
+
+For joins, incorrect build side selection can cause OOM:
+
+```scala
+override def tagPlanForGpu(): Unit = {
+  // Always validate build side can fit in GPU memory
+  val buildSideSize = estimateBuildSideSize()
+  val gpuMemory = getAvailableGpuMemory()
+
+  if (buildSideSize > gpuMemory * 0.8) {  // Leave 20% headroom
+    willNotWorkOnGpu(s"Build side too large: ${buildSideSize} bytes")
+  }
+}
+```
+
+#### 6. **Understand Data Distribution**
+
+Joins and aggregates are affected by data distribution:
+
+```
+Skewed Data:               Uniform Data:
+Worker 1: 90% of keys     Worker 1: 25% of keys
+Worker 2: 8% of keys      Worker 2: 25% of keys
+Worker 3: 2% of keys      Worker 3: 25% of keys
+                          Worker 4: 25% of keys
+↓ May cause OOM           ↓ Balanced, works well
+```
+
+Test with both uniform and skewed data distributions.
+
+### Next Steps After Mastering Complex Operators
+
+Once comfortable with aggregates and joins:
+
+1. **Window Functions** - Combines aspects of both
+2. **Custom Aggregates** - UDAFs with complex logic
+3. **Optimizing Existing Operators** - Performance tuning
+4. **Contributing to cuDF** - Add missing operations
+
+**Remember:** Complex doesn't mean impossible! Take your time, study existing code, test thoroughly, and don't hesitate to ask for help.
+
 ## Testing Strategy
 
 The RAPIDS Accelerator uses a **multi-layer testing approach**:
@@ -936,15 +1521,128 @@ case class GpuAcoshCompat(child: Expression) extends GpuUnaryMathExpression("ACO
 - **Discussions**: Join discussions at https://github.com/NVIDIA/spark-rapids/discussions
 - **Slack**: Join the [RAPIDS Slack](https://rapids.ai/community/) (#spark-rapids channel)
 
-### More Complex Operators
+### Progression Path
 
-As you gain experience, explore:
+Follow this path to build expertise systematically:
 
-1. **Binary Operations**: [arithmetic.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/arithmetic.scala)
-2. **Aggregations**: [aggregate.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/aggregate.scala)
-3. **Window Functions**: [window.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/window.scala)
-4. **Joins**: [execution/GpuHashJoin.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuHashJoin.scala)
-5. **Scans and Writes**: [docs/dev/data-sources.md](data-sources.md)
+#### Stage 1: Simple Unary Operators (Week 1-2)
+**Goal:** Understand the basics, build process, and testing
+
+Start with 2-3 of these:
+- **Math functions**: `sqrt`, `cbrt`, `asin`, `atan`, `tan`, `sinh`
+- **String functions**: `upper`, `lower`, `trim`, `ltrim`, `rtrim`
+- **Type conversions**: Simple casts between compatible types
+
+**Why start here:**
+- Single input/output, easiest to understand
+- cuDF has built-in operations
+- Minimal state management
+- Fast feedback loop
+
+**Resources:**
+- [mathExpressions.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/mathExpressions.scala)
+- [stringExpressions.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/stringExpressions.scala)
+
+#### Stage 2: Binary Operators (Week 3-4)
+**Goal:** Handle multiple inputs, understand type coercion
+
+Try these operators:
+- **Arithmetic**: `divide`, `remainder`, `pmod`
+- **String operations**: `concat`, `contains`, `startsWith`, `endsWith`
+- **Comparison**: `equalTo`, `greaterThan`, `lessThan`
+
+**New concepts:**
+- Type promotion (int + long → long)
+- Null handling with two inputs
+- Different data types on left vs right
+
+**Resources:**
+- [arithmetic.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/arithmetic.scala)
+
+#### Stage 3: Aggregate Functions (Week 5-8)
+**Goal:** Learn state management, partial aggregation, merging
+
+Recommended order:
+1. **Start simple**: `count`, `min`, `max` (stateless aggregation)
+2. **Add complexity**: `sum`, `avg` (requires numeric handling)
+3. **Advanced**: `collect_list`, `collect_set` (complex data structures)
+
+**New concepts:**
+- Initial values and state
+- Update vs merge operations
+- Handling overflow and ANSI mode
+- Group-by aggregation
+
+**Resources:**
+- [Complex Operators - Aggregate Example](#example-1-aggregate-function-gpusum) in this guide
+- [aggregateFunctions.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/aggregate/aggregateFunctions.scala)
+- [hash_aggregate_test.py](../../integration_tests/src/main/python/hash_aggregate_test.py)
+
+#### Stage 4: Join Operations (Week 9-12+)
+**Goal:** Master multi-table operations, understand broadcast vs shuffle
+
+Recommended progression:
+1. **Study existing code** for 1-2 weeks before implementing
+2. **Start with**: Understanding `BroadcastHashJoin` implementation
+3. **Contribute**: Optimizations or edge case fixes
+4. **Advanced**: Implement a new join strategy
+
+**New concepts:**
+- Build side vs stream side
+- Join types (inner, outer, semi, anti)
+- Broadcast variables and data distribution
+- Memory management for large tables
+- Data skew handling
+
+**Resources:**
+- [Complex Operators - Join Example](#example-2-join-operations-broadcasthashjoin) in this guide
+- [GpuHashJoin.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuHashJoin.scala)
+- [GpuBroadcastHashJoinExecBase.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuBroadcastHashJoinExecBase.scala)
+- [join_test.py](../../integration_tests/src/main/python/join_test.py)
+
+#### Stage 5: Advanced Topics (3+ months)
+Once comfortable with Stages 1-4:
+
+- **Window Functions**: Partitioning, ordering, frame boundaries
+- **Sort Operations**: Distributed sorting, partition-level sorts
+- **File I/O**: Parquet/ORC readers and writers
+- **Data Sources**: Custom data source implementations
+- **Performance Optimization**: Profile and optimize existing operators
+
+**Resources:**
+- [window.scala](../../sql-plugin/src/main/scala/org/apache/spark/sql/rapids/window.scala)
+- [data-sources.md](data-sources.md)
+
+### Milestone Checklist
+
+Track your progress:
+
+- [ ] **Beginner** (Stage 1): Completed 2-3 simple unary operators
+- [ ] **Intermediate** (Stage 2-3): Completed 2+ binary operators and 1+ aggregate
+- [ ] **Advanced** (Stage 4): Understand join implementations, contributed join optimization
+- [ ] **Expert** (Stage 5): Contributed window function or data source implementation
+- [ ] **Contributor**: Have 5+ merged pull requests
+- [ ] **Maintainer**: Help review others' contributions
+
+### Tips for Long-Term Success
+
+1. **Consistency over intensity**: Better to contribute 5 hours/week for 3 months than 40 hours in one week
+
+2. **Document as you learn**: Keep notes on challenges faced and solutions found
+
+3. **Engage with the community**:
+   - Comment on issues related to your work
+   - Help answer questions from other contributors
+   - Share your learnings in discussions
+
+4. **Quality over quantity**:
+   - One well-tested, thoroughly documented operator is better than three buggy ones
+   - Take time to understand why existing code works the way it does
+
+5. **Celebrate milestones**:
+   - First operator merged? Celebrate!
+   - Fixed a tricky bug? Share the solution!
+   - Helped another contributor? That's valuable too!
 
 ---
 
@@ -972,6 +1670,7 @@ For when you're deep in the code and need a quick reminder:
 
 | Class | Purpose | When to Use |
 |-------|---------|-------------|
+| **Simple Expressions** | | |
 | `GpuExpression` | Base for all GPU expressions | Extend for custom operators |
 | `GpuUnaryExpression` | Base for unary operations | Single input operators |
 | `GpuBinaryExpression` | Base for binary operations | Two input operators |
@@ -979,19 +1678,38 @@ For when you're deep in the code and need a quick reminder:
 | `CudfUnaryMathExpression` | Math unary with AST support | Math functions |
 | `UnaryExprMeta[T]` | Metadata for unary expressions | Validation and tagging |
 | `BinaryExprMeta[T]` | Metadata for binary expressions | Validation and tagging |
+| **Complex Operators** | | |
+| `AggExprMeta[T]` | Metadata for aggregate expressions | Sum, count, avg, etc. |
+| `GpuAggregateFunction` | Base for GPU aggregates | Custom aggregate functions |
+| `CudfAggregate` | cuDF aggregate wrapper | Delegates to cuDF aggregations |
+| `SparkPlanMeta[T]` | Metadata for physical plans | Joins, sorts, scans, etc. |
+| `GpuExec` | Base for GPU physical operators | Physical execution operators |
+| `GpuBuildSide` | Join build side indicator | Which side to build hash table |
+| **Data Structures** | | |
 | `GpuColumnVector` | Wraps cuDF Column | Access GPU data |
 | `ColumnVector` | cuDF's column data structure | Result of GPU operations |
+| `ColumnarBatch` | Batch of columnar data | Multiple columns together |
 
 ### File Locations
 
 | What You Need | Where to Look |
 |---------------|---------------|
+| **Expressions** | |
 | Math operators | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/mathExpressions.scala` |
 | Arithmetic operators | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/arithmetic.scala` |
 | String operators | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/stringExpressions.scala` |
+| **Complex Operators** | |
+| Aggregate functions | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/aggregate/aggregateFunctions.scala` |
+| Aggregate base classes | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/aggregate/aggregateBase.scala` |
+| Join operations | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuHashJoin.scala` |
+| Broadcast hash join | `sql-plugin/src/main/scala/org/apache/spark/sql/rapids/execution/GpuBroadcastHashJoinExecBase.scala` |
+| **Core Files** | |
 | Registration | `sql-plugin/src/main/scala/com/nvidia/spark/rapids/GpuOverrides.scala` |
 | Type signatures | `sql-plugin/src/main/scala/com/nvidia/spark/rapids/TypeSig.scala` |
+| **Testing** | |
 | Integration tests | `integration_tests/src/main/python/*_test.py` |
+| Join tests | `integration_tests/src/main/python/join_test.py` |
+| Aggregate tests | `integration_tests/src/main/python/hash_aggregate_test.py` |
 
 ### Common Patterns
 
